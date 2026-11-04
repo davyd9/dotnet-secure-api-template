@@ -2,9 +2,9 @@ using System.Text;
 using DotnetSecureApi.Api.Configuration;
 using DotnetSecureApi.Api.Diagnostics;
 using DotnetSecureApi.Api.Middleware;
+using FluentValidation;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
-using Microsoft.OpenApi.Models;
 using Serilog;
 
 // Configure Serilog for bootstrap logging
@@ -12,31 +12,40 @@ Log.Logger = new LoggerConfiguration()
     .WriteTo.Console()
     .CreateBootstrapLogger();
 
-Log.Information("Starting up the application");
+Log.Information("Starting up");
 
 try
 {
     var builder = WebApplication.CreateBuilder(args);
 
-    // Replace default logger with Serilog
+    // --- Logging Configuration ---
     builder.Host.UseSerilog((context, services, configuration) => configuration
         .ReadFrom.Configuration(context.Configuration)
         .ReadFrom.Services(services)
         .Enrich.FromLogContext());
 
-    // --- Service Configuration ---
+    // --- Configuration ---
+    builder.Services.Configure<JwtSettings>(builder.Configuration.GetSection("JwtSettings"));
 
-    // 1. Add strongly-typed configuration
-    var jwtSettings = new JwtSettings();
-    builder.Configuration.Bind(nameof(JwtSettings), jwtSettings);
-    builder.Services.AddSingleton(jwtSettings);
+    // --- Service Registration ---
+    builder.Services.AddControllers();
+    builder.Services.AddEndpointsApiExplorer();
+    builder.Services.AddSwaggerGen();
 
-    // 2. Add Authentication and Authorization services
+    // Add validation services from the current assembly
+    builder.Services.AddValidatorsFromAssemblyContaining<Program>();
+
+    // --- Diagnostics and Metrics ---
+    builder.Services.AddSingleton<ApiMetrics>();
+
+    // --- Authentication & Authorization ---
+    var jwtSettings = builder.Configuration.GetSection("JwtSettings").Get<JwtSettings>()!;
     builder.Services.AddAuthentication(options =>
     {
         options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
         options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
-    }).AddJwtBearer(options =>
+    })
+    .AddJwtBearer(options =>
     {
         options.TokenValidationParameters = new TokenValidationParameters
         {
@@ -46,7 +55,7 @@ try
             ValidateIssuerSigningKey = true,
             ValidIssuer = jwtSettings.Issuer,
             ValidAudience = jwtSettings.Audience,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSettings.Secret))
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSettings.Key))
         };
     });
 
@@ -55,50 +64,14 @@ try
         options.AddPolicy("UserAccessible", policy => policy.RequireRole("Admin", "User"));
     });
 
-    // 3. Add Metrics and Diagnostics
-    builder.Services.AddSingleton<ApiMetrics>();
-    builder.Services.AddMetrics();
-
-    // 4. Add Controllers and API Explorer
-    builder.Services.AddControllers();
-    builder.Services.AddEndpointsApiExplorer();
-    builder.Services.AddSwaggerGen(c =>
-    {
-        c.SwaggerDoc("v1", new OpenApiInfo { Title = "Dotnet Secure API", Version = "v1" });
-        c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
-        {
-            In = ParameterLocation.Header,
-            Description = "Please enter a valid token",
-            Name = "Authorization",
-            Type = SecuritySchemeType.Http,
-            BearerFormat = "JWT",
-            Scheme = "Bearer"
-        });
-        c.AddSecurityRequirement(new OpenApiSecurityRequirement
-        {
-            {
-                new OpenApiSecurityScheme
-                {
-                    Reference = new OpenApiReference
-                    {
-                        Type = ReferenceType.SecurityScheme,
-                        Id = "Bearer"
-                    }
-                },
-                Array.Empty<string>()
-            }
-        });
-    });
-
-    // --- Application Pipeline Configuration ---
-
     var app = builder.Build();
 
-    // Use Serilog for rich, structured request logging
+    // --- Middleware Pipeline ---
     app.UseSerilogRequestLogging();
 
-    // Use custom middleware for capturing request metrics
-    app.UseRequestMetrics();
+    // Custom middleware registration
+    app.UseErrorHandlingMiddleware();
+    app.UseMiddleware<RequestMetricsMiddleware>();
 
     if (app.Environment.IsDevelopment())
     {
@@ -117,10 +90,10 @@ try
 }
 catch (Exception ex)
 {
-    Log.Fatal(ex, "Application terminated unexpectedly");
+    Log.Fatal(ex, "Unhandled exception");
 }
 finally
 {
-    Log.Information("Shutting down the application");
+    Log.Information("Shut down complete");
     Log.CloseAndFlush();
 }
